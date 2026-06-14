@@ -796,82 +796,21 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
 
 // 过滤可疑的广告内容
 //
-// 背景：插播广告通常通过 #EXT-X-DISCONTINUITY 标记把广告片段拼接进正片，
-// 这些 DISCONTINUITY 把整个 playlist 切成若干“连续块”，例如：
-//     [正片块] DISC [广告块] DISC [正片块] ...   或   [前贴片广告] DISC [正片块]
+// 历史教训：曾尝试通过 #EXT-X-DISCONTINUITY 来识别并删除广告分段，但实践证明这
+// 极不可靠——不同源对 DISCONTINUITY 的用法千差万别（有的几乎每个分段前都加、有的
+// 正片本身也被频繁切分）。任何基于它的删段/丢块策略都会误伤正片，造成：
+//   - 删除标记 → 破坏时间轴 → 假 ended → 误跳下一集；
+//   - 丢弃分段 → 总时长错误、正片只剩几十秒 → 真 ended → 误跳下一集。
 //
-// 旧实现存在两类问题：
-//   1) 只删 DISCONTINUITY 标记行、保留广告段 → 没去广告且破坏时间轴，导致假 ended 跳集；
-//   2) 简单地按标记“奇偶切换”丢弃 → 结构不规则时会误删正片、只剩广告。
+// 结论：不对 playlist 做任何结构性改动，保持时间轴与总时长完全正确，让 hls.js 按
+// 标准方式处理 DISCONTINUITY（广告会内联播放但不会破坏播放）。误连播的问题改由
+// video:ended 中的“真实结束校验”兜底（currentTime 必须接近 duration 才连播）。
 //
-// 新实现：把 playlist 按 DISCONTINUITY 切块并累计各块时长。广告块时长通常很短（数十秒），
-// 正片块时长很长（数分钟以上，中插广告会把正片切成多个长块）。因此丢弃“短块”（视为广告），
-// 保留所有“长块”作为正片；并始终至少保留最长块兜底。保留块内部连续，时间轴完整、不会假结束。
+// 如需真正按源精确去广告，需要拿到该源真实的 m3u8 结构再做针对性处理。
 function filterAdsFromM3U8(m3u8Content, strictMode = false) {
-    // 时长不超过该阈值（秒）的连续块视为广告并丢弃；正片块远长于此
-    const AD_BLOCK_MAX_SECONDS = 90;
     if (!m3u8Content) return '';
-
-    // 非严格模式下不改动 playlist，保持时间轴完整
-    if (!strictMode) return m3u8Content;
-
-    const lines = m3u8Content.split('\n');
-    const header = [];   // 第一个分段之前的全局标签（#EXTM3U、#EXT-X-VERSION 等）
-    const footer = [];   // #EXT-X-ENDLIST 等收尾标签
-    const blocks = [];   // 由 DISCONTINUITY 切分出的连续块：{ lines: [], duration: 0 }
-    let current = null;
-    let started = false; // 是否已遇到第一个分段（#EXTINF）
-
-    const newBlock = () => { current = { lines: [], duration: 0 }; blocks.push(current); };
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const t = line.trim();
-
-        if (t.startsWith('#EXT-X-DISCONTINUITY')) {
-            // 不连续标记：开启新块（标记本身丢弃，块内不再保留 DISCONTINUITY）
-            if (started) newBlock();
-            continue;
-        }
-
-        if (t.startsWith('#EXT-X-ENDLIST')) {
-            footer.push(line);
-            continue;
-        }
-
-        if (t.startsWith('#EXTINF')) {
-            if (!started) { started = true; if (!current) newBlock(); }
-            const m = t.match(/#EXTINF:\s*([\d.]+)/);
-            if (m) current.duration += parseFloat(m[1]) || 0;
-            current.lines.push(line);
-            continue;
-        }
-
-        if (!started) {
-            // 还没遇到分段，视为头部全局标签
-            header.push(line);
-            continue;
-        }
-
-        // 已进入分段区域：URI 行或分段级标签（#EXT-X-KEY/#EXT-X-MAP/#EXT-X-BYTERANGE 等）归入当前块
-        current.lines.push(line);
-    }
-
-    const realBlocks = blocks.filter(b => b.lines.length > 0);
-
-    // 只有 0 或 1 个块 → 没有插播广告，原样返回，保持时间轴
-    if (realBlocks.length <= 1) return m3u8Content;
-
-    // 找出最长块作为兜底（确保至少保留正片主体，绝不把整部片子都丢掉）
-    let main = realBlocks[0];
-    for (const b of realBlocks) {
-        if (b.duration > main.duration) main = b;
-    }
-
-    // 保留：最长块 + 所有时长超过广告阈值的块（中插广告会把正片切成多个长块，需全部保留）
-    const kept = realBlocks.filter(b => b === main || b.duration > AD_BLOCK_MAX_SECONDS);
-
-    return [...header, ...kept.flatMap(b => b.lines), ...footer].join('\n');
+    // 原样返回，不做任何删段/删标记操作，确保时长与时间轴正确
+    return m3u8Content;
 }
 
 
