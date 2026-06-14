@@ -358,6 +358,15 @@ function handleKeyboardShortcuts(e) {
             e.preventDefault();
         }
     }
+
+    // d 键 = 跳过广告（seek 到下一个不连续点）
+    if (e.key === 'd' || e.key === 'D') {
+        if (art) {
+            skipToNextDiscontinuity();
+            showShortcutHint('跳过广告', 'right');
+            e.preventDefault();
+        }
+    }
 }
 
 // 显示快捷键提示
