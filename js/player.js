@@ -91,6 +91,7 @@ let shortcutHintTimeout = null; // 用于控制快捷键提示显示时间
 let adFilteringEnabled = true; // 默认开启广告过滤
 let progressSaveInterval = null; // 定期保存进度的计时器
 let currentVideoUrl = ''; // 记录当前实际的视频URL
+let discontinuityTimes = []; // 各 #EXT-X-DISCONTINUITY 边界对应的播放时间(秒)，供“跳过广告”按钮使用
 const isWebkit = (typeof window.webkitConvertPointFromNodeToPage === 'function')
 Artplayer.FULLSCREEN_WEB_IN_BODY = true;
 
@@ -471,6 +472,18 @@ function initPlayer(videoUrl) {
         moreVideoAttr: {
             crossOrigin: 'anonymous',
         },
+        controls: [
+            {
+                name: 'skip-ad',
+                position: 'right',
+                html: '跳过广告',
+                tooltip: '跳到下一个不连续点（广告边界）',
+                style: { color: '#fff', padding: '0 10px' },
+                click: function () {
+                    skipToNextDiscontinuity();
+                },
+            },
+        ],
         customType: {
             m3u8: function (video, url) {
                 // 清理之前的HLS实例
@@ -484,6 +497,9 @@ function initPlayer(videoUrl) {
                 // 创建新的HLS实例
                 const hls = new Hls(hlsConfig);
                 currentHls = hls;
+
+                // 重置上一集遗留的不连续点
+                discontinuityTimes = [];
 
                 // 跟踪是否已经显示错误
                 let errorDisplayed = false;
@@ -576,8 +592,26 @@ function initPlayer(videoUrl) {
                 });
 
                 // 监听级别加载事件
-                hls.on(Hls.Events.LEVEL_LOADED, function () {
+                hls.on(Hls.Events.LEVEL_LOADED, function (event, data) {
                     document.getElementById('player-loading').style.display = 'none';
+
+                    // 计算所有 #EXT-X-DISCONTINUITY 边界的播放时间，供“跳过广告”按钮使用。
+                    // hls.js 为每个分段维护连续计数 cc：每遇到一个 DISCONTINUITY，cc 加 1。
+                    // 因此 cc 发生变化的那个分段的起始时间，就是一个不连续点(广告/正片块边界)。
+                    try {
+                        const frags = (data && data.details && data.details.fragments) || [];
+                        const times = [];
+                        let prevCC = frags.length ? frags[0].cc : 0;
+                        for (const f of frags) {
+                            if (f.cc !== prevCC) {
+                                times.push(f.start);
+                                prevCC = f.cc;
+                            }
+                        }
+                        discontinuityTimes = times;
+                    } catch (e) {
+                        discontinuityTimes = [];
+                    }
                 });
             }
         }
@@ -811,6 +845,25 @@ function filterAdsFromM3U8(m3u8Content, strictMode = false) {
     if (!m3u8Content) return '';
     // 原样返回，不做任何删段/删标记操作，确保时长与时间轴正确
     return m3u8Content;
+}
+
+// 跳过广告：seek 到当前位置之后的下一个不连续点(DISCONTINUITY 边界)。
+// 由用户判断当前是否为广告并主动点击，机器只负责把跳转位置精确对齐到块边界，
+// 因此跳转距离自动匹配广告时长、且纯 seek 不改动 playlist、不会误删正片。
+function skipToNextDiscontinuity() {
+    if (!art || !art.video) return;
+    const t = art.currentTime || 0;
+    // 找到第一个明显在当前位置之后的不连续点(留 0.5s 容差避免原地不动)
+    const next = (discontinuityTimes || []).find(x => isFinite(x) && x > t + 0.5);
+
+    if (next != null) {
+        art.currentTime = next;
+        const mm = Math.floor(next / 60);
+        const ss = Math.floor(next % 60);
+        if (art.notice) art.notice.show = `已跳过 → ${mm}:${String(ss).padStart(2, '0')}`;
+    } else {
+        if (art.notice) art.notice.show = '前方没有可跳过的广告点';
+    }
 }
 
 
