@@ -712,6 +712,19 @@ function initPlayer(videoUrl) {
 
     // 视频播放结束事件
     art.on('video:ended', function () {
+        // 校验是否“真正”播放到结尾，避免插播广告造成的时间戳跳变触发假结束事件，
+        // 从而错误地跳转到下一集。
+        const duration = art.video ? art.video.duration : 0;
+        const currentTime = art.video ? art.video.currentTime : 0;
+        // duration 必须有效，且当前播放位置必须接近结尾（容差 2 秒）才视为真正结束
+        const reallyEnded = isFinite(duration) && duration > 0 && currentTime >= duration - 2;
+
+        if (!reallyEnded) {
+            // 假结束（多为广告插播导致的 PTS 跳变），忽略本次事件，继续播放
+            console.warn(`忽略疑似假结束事件: currentTime=${currentTime.toFixed(2)}, duration=${duration.toFixed(2)}`);
+            return;
+        }
+
         videoHasEnded = true;
 
         clearVideoProgress();
@@ -720,7 +733,6 @@ function initPlayer(videoUrl) {
         if (autoplayEnabled && currentEpisodeIndex < currentEpisodes.length - 1) {
             // 稍长延迟以确保所有事件处理完成
             setTimeout(() => {
-                // 确认不是因为用户拖拽导致的假结束事件
                 playNextEpisode();
                 videoHasEnded = false; // 重置标志
             }, 1000);
@@ -783,18 +795,35 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
 }
 
 // 过滤可疑的广告内容
+//
+// 注意：旧实现仅删除 #EXT-X-DISCONTINUITY 标记行、却保留了标记之间的广告片段，
+// 这既没有真正去除广告，又破坏了 HLS 时间轴（广告段 PTS 重置后无标记告知播放器），
+// 导致播放到广告处时 currentTime 跳变、提前触发 ended 事件而错误连播下一集。
+//
+// 新实现：要么完整移除“一对 DISCONTINUITY 之间的广告段块”，要么完全不改动 playlist。
+// 默认采取保守策略——不修改 playlist，避免破坏时间轴；仅在 strictMode 下尝试整块移除。
 function filterAdsFromM3U8(m3u8Content, strictMode = false) {
     if (!m3u8Content) return '';
 
-    // 按行分割M3U8内容
+    // 非严格模式下不改动 playlist，保持时间轴完整，避免假结束事件
+    if (!strictMode) return m3u8Content;
+
     const lines = m3u8Content.split('\n');
     const filteredLines = [];
+    let inAdBlock = false;
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
 
-        // 只过滤#EXT-X-DISCONTINUITY标识
-        if (!line.includes('#EXT-X-DISCONTINUITY')) {
+        if (line.includes('#EXT-X-DISCONTINUITY')) {
+            // 切换广告块状态：进入广告块时丢弃该块内的所有片段，
+            // 直到遇到下一个 DISCONTINUITY 标记（广告块结束）。
+            // 注意：DISCONTINUITY 标记行本身也一并丢弃。
+            inAdBlock = !inAdBlock;
+            continue;
+        }
+
+        if (!inAdBlock) {
             filteredLines.push(line);
         }
     }
